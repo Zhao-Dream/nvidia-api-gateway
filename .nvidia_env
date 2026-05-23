@@ -1,0 +1,13 @@
+# NVIDIA_API_KEY
+NVIDIA_API_KEY_1=nvapi-nvapi-******
+NVIDIA_API_KEY_2=nvapi-nvapi-******
+NVIDIA_API_KEY_3=nvapi-nvapi-******
+
+# 要使用的模型（可选，默认值：deepseek-ai/deepseek-v4-pro）
+NVIDIA_MODEL=deepseek-ai/deepseek-v4-pro
+
+# API 基本 URL（可选，通常无需更改）
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+
+# 调试模式：1 启用，0 禁用（可选）
+NVIDIA_DEBUG=0
