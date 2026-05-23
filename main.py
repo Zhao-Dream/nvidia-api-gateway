@@ -5,10 +5,14 @@ import json
 import uuid
 import getpass
 
+from dataclasses import dataclass, field
+import threading
+
 from flask import Flask, request, Response
 from openai import OpenAI
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")  # 日志统一存放目录
 
 
 def _load_dotenv():
@@ -16,7 +20,7 @@ def _load_dotenv():
     env_file = os.path.join(BASE_DIR, ".nvidia_env")
     if not os.path.exists(env_file):
         return
-    had_key = "NVIDIA_API_KEY" in os.environ
+    had_key = "NVIDIA_API_KEYS" in os.environ
     with open(env_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -26,27 +30,51 @@ def _load_dotenv():
             key, val = key.strip(), val.strip().strip("\"'")
             if key and key not in os.environ:
                 os.environ[key] = val
-    if "NVIDIA_API_KEY" in os.environ:
+    if "NVIDIA_API_KEYS" in os.environ:
         os.environ["_NVIDIA_KEY_SOURCE"] = "sys" if had_key else "dotenv"
 
 
-def _ensure_api_key():
-    """确保 NVIDIA_API_KEY 已设置：系统环境变量 > .nvidia_env > 交互输入"""
-    key = os.environ.get("NVIDIA_API_KEY", "").strip()
-    if key:
+
+
+# ============================================================
+# 从 .nvidia_env 解析所有 Key（支持多个 Key）
+# 格式:
+# NVIDIA_API_KEY_1=nvapi-******
+# NVIDIA_API_KEY_2=nvapi-******
+# ... ...
+# NVIDIA_API_KEY_20=nvapi-******
+# ============================================================
+def _parse_all_keys() -> list:
+    """从环境变量中解析所有 NVIDIA API Key"""
+    keys = []
+    seen = set()
+    for i in range(1, 21):
+        k = os.environ.get(f"NVIDIA_API_KEY_{i}", "").strip()
+        if k and k not in seen:
+            keys.append(k)
+            seen.add(k)
+        else:
+            break
+    return keys
+
+
+def _ensure_api_keys():
+    """确保至少有一个 API Key，若一个都没有则交互输入"""
+    all_keys = _parse_all_keys()
+    if all_keys:
         src = os.environ.get("_NVIDIA_KEY_SOURCE", "")
         if src == "sys":
-            return key, "系统环境变量"
-        return key, ".nvidia_env"
+            return all_keys, "系统环境变量"
+        return all_keys, ".nvidia_env"
 
     print("=" * 60)
-    print("  未检测到 NVIDIA_API_KEY")
+    print("  未检测到任何 NVIDIA API Key")
     print("=" * 60)
     print()
     print("  从 https://build.nvidia.com/ 获取 API Key")
     print("  登录后点击任一模型 → Get API Key")
     print()
-    print("  你也可以设置系统环境变量 NVIDIA_API_KEY 后重启")
+    print("  你也可以设置系统环境变量 NVIDIA_API_KEYS 后重试")
     print()
 
     try:
@@ -54,14 +82,16 @@ def _ensure_api_key():
     except (EOFError, KeyboardInterrupt):
         key = ""
 
-    if not key:
+    if not keys:
         print()
         print("  ERROR: 未输入 API Key，程序退出。")
         print()
-        input("  按 Enter 退出...")
+        input("  按 Enter 退出 ...")
         sys.exit(1)
 
+    # 保存到 .nvidia_env
     env_file = os.path.join(BASE_DIR, ".nvidia_env")
+    all_keys = [key]
     existing = {}
     if os.path.exists(env_file):
         with open(env_file, "r", encoding="utf-8") as f:
@@ -71,33 +101,137 @@ def _ensure_api_key():
                     continue
                 k, _, v = line.partition("=")
                 existing[k.strip()] = f"{k.strip()}={v.strip()}"
-    existing["NVIDIA_API_KEY"] = f"NVIDIA_API_KEY={key}"
+    existing["NVIDIA_API_KEYS"] = f"NVIDIA_API_KEYS={key}"
 
     with open(env_file, "w", encoding="utf-8") as f:
         for line in existing.values():
-            f.write(line + "\n")
+            f.write(line + "\\n")
         if "NVIDIA_MODEL" not in existing:
-            f.write("NVIDIA_MODEL=nvidia/llama-3.1-nemotron-70b-instruct\n")
+            f.write("NVIDIA_MODEL=deepseek-ai/deepseek-v4-pro\\n")
 
-    os.environ["NVIDIA_API_KEY"] = key
+    os.environ["NVIDIA_API_KEYS"] = key
     print()
-    print(f"  API Key 已保存到: {env_file}")
+    print(f"  API Key 已保存到: {env_file} (支持多个 Key 用逗号分隔)")
     print()
-    return key, ".nvidia_env (已保存)"
-
+    return all_keys, ".nvidia_env (已保存)"
 
 _load_dotenv()
 
-DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nvidia_proxy_debug.log")
-
 app = Flask(__name__)
 
-# ===================== 配置 =====================
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "").strip()
-NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "").strip()
-NVIDIA_DEBUG = os.environ.get("NVIDIA_DEBUG", "0").strip() in ("1", "true", "True", "yes")
-# =================================================
+
+# ============================================================
+# 配置类 ---- 所有配置项统一封装到 dataclass
+# ============================================================
+@dataclass
+class AppConfig:
+    """应用全局配置，所有配置项统一管理"""
+    # --- API Key 列表（多 Key 支持）---
+    api_keys: list = field(default_factory=list)
+    # --- 当前使用的 Key 索引 ---
+    current_key_index: int = 0
+    # --- 线程锁，保证 Key 切换的线程安全 ---
+    key_lock: threading.Lock = field(default_factory=threading.Lock)
+    # --- 模型名称 ---
+    model: str = ""
+    # --- 基础 URL ---
+    base_url: str = ""
+    # --- 调试模式 ---
+    debug: bool = False
+    # --- 日志目录 ---
+    log_dir: str = ""
+    # --- 调试日志文件 ---
+    debug_log: str = ""
+
+    @classmethod
+    def create(cls) -> "AppConfig":
+        """从环境变量和文件创建配置实例"""
+        # 解析所有 API Key
+        api_keys = _parse_all_keys()
+
+        # 模型名称
+        model = os.environ.get("NVIDIA_MODEL", "").strip()
+        if not model:
+            model = "deepseek-ai/deepseek-v4-pro"
+
+        # 基础 URL
+        base_url = os.environ.get("NVIDIA_BASE_URL", "").strip()
+        if not base_url:
+            base_url = "https://integrate.api.nvidia.com/v1"
+
+        # 调试模式
+        debug_val = os.environ.get("NVIDIA_DEBUG", "0").strip()
+        debug = debug_val in ("1", "true", "True", "yes")
+
+        # 日志目录
+        log_dir = os.environ.get("NVIDIA_LOG_DIR", "").strip()
+        if not log_dir:
+            log_dir = LOG_DIR
+
+        return cls(
+            api_keys=api_keys,
+            model=model,
+            base_url=base_url,
+            debug=debug,
+            log_dir=log_dir,
+            debug_log=os.path.join(log_dir, "nvidia_proxy_debug.log"),
+        )
+
+    @property
+    def current_key(self) -> str:
+        """获取当前使用的 API Key"""
+        if not self.api_keys:
+            return ""
+        return self.api_keys[self.current_key_index]
+
+    def rotate_key(self) -> bool:
+        """切换到下一个 Key，返回 True 表示切换成功"""
+        with self.key_lock:
+            if len(self.api_keys) <= 1:
+                return False
+            old_idx = self.current_key_index
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            new_preview = self.current_key[:20] + "..." if len(self.current_key) > 20 else self.current_key
+            print(f"  [Key切换] 索引 {old_idx} -> {self.current_key_index}, Key: {new_preview}")
+            return True
+
+    def get_openai_client(self, key_index: int | None = None) -> OpenAI:
+        """根据指定索引创建 OpenAI 客户端"""
+        idx = key_index if key_index is not None else self.current_key_index
+        if idx >= len(self.api_keys):
+            idx = 0
+        return OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_keys[idx],
+        )
+
+
+# ============================================================
+# 全局配置实例
+# ============================================================
+config = AppConfig.create()
+
+
+# ============================================================
+# CORS 头注入 ---- 为所有响应添加跨域头
+# ============================================================
+@app.after_request
+def _add_cors_headers(response: Response) -> Response:
+    """为所有响应添加 CORS 跨域头"""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-request-id"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+# ============================================================
+# GET /health 健康检查端点
+# ============================================================
+@app.route("/health", methods=["GET"])
+def health_check():
+    """返回服务状态，确保服务可用"""
+    return {"status": "ok"}, 200, {"Content-Type": "application/json"}
 
 
 def _clean_schema(obj):
@@ -303,11 +437,11 @@ def _make_response():
 
     req_data = request.get_json(silent=True) or {}
     messages, tools, tool_choice = extract_messages(req_data)
-    effective_model = req_data.get("model") or NVIDIA_MODEL
+    effective_model = req_data.get("model") or config.model
     response_id = f"resp_{uuid.uuid4().hex[:12]}"
 
-    if NVIDIA_DEBUG:
-        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+    if config.debug:
+        with open(config.debug_log, "a", encoding="utf-8") as f:
             f.write(f"\n--- [{__import__('datetime').datetime.now()}] ---\n")
             f.write(f"Messages:\n{json.dumps(messages, indent=2, ensure_ascii=False)}\n")
             if tools:
@@ -350,8 +484,8 @@ def _make_response():
 
         # 使用 OpenAI 客户端连接 NVIDIA API（已验证可用）
         client = OpenAI(
-            base_url=NVIDIA_BASE_URL,
-            api_key=NVIDIA_API_KEY,
+            base_url=config.base_url,
+            api_key=config.current_key,
         )
 
         # 构建请求参数
@@ -550,9 +684,20 @@ def _make_response():
             }, ensure_ascii=False) + "\n\n"
 
         except Exception as e:
-            err_msg = f"NVIDIA API error: {type(e).__name__}: {e}"
-            if NVIDIA_DEBUG:
-                with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            # 检测 HTTP 429（超出速率限制），自动切换到下一个 Key 并重试
+            is_429 = False
+            if hasattr(e, "status_code") and e.status_code == 429:
+                is_429 = True
+            elif "429" in str(e) or "rate" in str(e).lower() or "quota" in str(e).lower():
+                is_429 = True
+
+            if is_429 and config.rotate_key():
+                err_msg = f"NVIDIA API 429 (速率限制)，已切换 Key 索引 -> {config.current_key_index}，请重试"
+            else:
+                err_msg = f"NVIDIA API error: {type(e).__name__}: {e}"
+
+            if config.debug:
+                with open(config.debug_log, "a", encoding="utf-8") as f:
                     f.write(f"ERROR: {err_msg}\n")
             yield "event: response.failed\n"
             yield "data: " + json.dumps({
@@ -579,16 +724,100 @@ app.add_url_rule("/v1/chat/completions", "v1_chat", _make_response, methods=["PO
 
 
 if __name__ == "__main__":
-    key, source = _ensure_api_key()
-    if not key:
-        sys.exit(1)
-    globals()["NVIDIA_API_KEY"] = key
+    import requests as _requests
 
+    # ========================================================
+    # 第1步：创建日志目录 + 清空之前的日志
+    # ========================================================
+    os.makedirs(config.log_dir, exist_ok=True)
+    # 清空调试日志
+    with open(config.debug_log, "w", encoding="utf-8") as _f:
+        _f.write(f"=== 启动时间: {__import__('datetime').datetime.now().isoformat()} ===\n")
+    # print(f"[日志] 已清空并初始化: {config.debug_log}")
+
+    # ========================================================
+    # 第2步：确保至少有一个 Key
+    # ========================================================
+    keys, source = _ensure_api_keys()
+    if not keys:
+        sys.exit(1)
+    # 重新更新 config（因为可能交互输入了新 Key）
+    config.api_keys = keys
+    config.current_key_index = 0
+
+    # ========================================================
+    # 第3步：检测所有 Key 的健康状态（GET https://.../health 或 /v1/models）
+    # ========================================================
+    print()
+    print("=" * 60)
+    print("  正在检测所有 API Key 的健康状态...")
+    print("=" * 60)
+    key_check_results = []
+    for idx, key in enumerate(config.api_keys):
+        preview = key[:10] + "...." + key[-8:] if len(key) > 18 else key
+        try:
+            # NVIDIA API 健康检测：尝试获取 models 列表
+            resp = _requests.get(
+                f"{config.base_url}/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                status = "✔ 可用"
+                key_check_results.append((idx, preview, True, f"HTTP {resp.status_code}"))
+            elif resp.status_code == 429:
+                status = "✘ 429 限流"
+                key_check_results.append((idx, preview, False, f"HTTP 429 (速率限制)"))
+            elif resp.status_code in (401, 403):
+                status = "✘ 认证失败"
+                key_check_results.append((idx, preview, False, f"HTTP {resp.status_code} (认证失败)"))
+            else:
+                status = f"⚠ HTTP {resp.status_code}"
+                key_check_results.append((idx, preview, True, f"HTTP {resp.status_code}"))
+        except Exception as ex:
+            status = f"✘ 连接失败"
+            key_check_results.append((idx, preview, False, f"{type(ex).__name__}"))
+
+        print(f"  [{idx}] {preview} -> {status}")
+
+    # 统计可用 Key
+    available_keys = [r for r in key_check_results if r[2]]
+    print()
+    print(f"  共检测 {len(config.api_keys)} 个 Key，可用 {len(available_keys)} 个")
+    if not available_keys:
+        print()
+        print("  ERROR: 所有 Key 均不可用，无法启动服务！")
+        print()
+        input("  按 Enter 退出 ...")
+        sys.exit(1)
+
+    # 将当前索引对准第一个可用 Key
+    if not key_check_results[config.current_key_index][2]:
+        for r in key_check_results:
+            if r[2]:
+                config.current_key_index = r[0]
+                print(f"  [自动] 当前 Key 切换至索引 {r[0]}: {r[1]}")
+                break
+
+    # 保存检测结果日志
+    check_log_path = os.path.join(config.log_dir, "key_check.log")
+    with open(check_log_path, "w", encoding="utf-8") as _f:
+        _f.write(f"=== Key 健康检测 ({__import__('datetime').datetime.now().isoformat()}) ===\n")
+        for idx, preview, ok, detail in key_check_results:
+            _f.write(f"[{idx}] {preview} -> {'OK' if ok else 'FAIL'}: {detail}\n")
+        _f.write(f"可用: {len(available_keys)}/{len(config.api_keys)}\n")
+
+    # ========================================================
+    # 第4步：启动服务
+    # ========================================================
+    print()
     from waitress import serve
-    print("codex_nvidia_proxy starting ...")
-    print(f"   Endpoint: http://127.0.0.1:5000")
-    print(f"   Model:    {NVIDIA_MODEL}")
-    print(f"   Key:      {source}")
-    print(f"   Debug:    {'ON' if NVIDIA_DEBUG else 'OFF'}")
-    print(f"   Routes:   /responses, /v1/responses, /v1/chat/completions")
+    print("codex_nvidia_proxy 启动中 ...")
+    print(f"   Endpoint:  http://127.0.0.1:5000")
+    print(f"   Health:    http://127.0.0.1:5000/health")
+    print(f"   Model:     {config.model}")
+    print(f"   Key总数:   {len(config.api_keys)} (来源: {source})")
+    print(f"   Key索引:   {config.current_key_index}")
+    print(f"   Debug:     {'ON' if config.debug else 'OFF'}")
+    print()
     serve(app, host="127.0.0.1", port=5000, threads=4)
